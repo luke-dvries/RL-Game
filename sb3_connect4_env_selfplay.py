@@ -3,27 +3,34 @@ import gymnasium as gym
 from gymnasium import spaces
 from typing import Optional, Tuple, Dict, Any, Callable
 
+# Type for a function the env can call to get the opponent's move.
+# Signature: (env, obs: np.ndarray, mask: np.ndarray[bool]) -> int
+OpponentFn = Callable[["Connect4", np.ndarray, np.ndarray], int]
+
 
 class Connect4(gym.Env):
     """
-    Single-agent Connect-4 environment.
-    Agent stones = +1, opponent stones = -1, empty = 0 (fixed perspective).
-    The environment normally plays the opponent *inside step()* before returning an observation.
-    This version also supports opponent="human" by calling a provided callback to get the move.
+    Single-agent Connect-4 environment with multiple opponent modes:
+      - "random": uniform over legal moves
+      - "heuristic": try to win, then block, then prefer center
+      - "policy": call a user-provided function (e.g., frozen PPO) to select the opponent move
+      - "human": call a user-provided function to ask a human
+
+    Board encoding (fixed perspective):
+      +1 = agent (the learner, "X")
+      -1 = opponent (the sparring partner, "O")
+       0 = empty
 
     Rewards:
-      +1.0  agent wins
-      -1.0  agent loses
+      +1.0  agent win
+      -1.0  agent loss (opponent win)
        0.0  draw
-     -0.01  per valid step (shaping; configurable)
-     -0.05  invalid action (no turn consumed)
+     -0.01  step penalty (configurable)
+     -0.05  illegal move penalty (no turn consumed)
 
-    Info keys:
-      - "action_mask": bool[7]
-      - "winner": +1 (agent), -1 (opponent), 0 (draw), or None
-      - "opp_action": int column chosen by opponent (if any)
-      - "invalid_action": bool
-      - "opp_started": bool
+    Observation: flat (42,) float32 in {-1, 0, +1}
+    Action space: Discrete(7)
+    Info includes "action_mask" (bool[7]), "winner", "opp_action".
     """
     metadata = {"render_modes": ["human"]}
 
@@ -33,15 +40,16 @@ class Connect4(gym.Env):
     def __init__(
         self,
         seed: Optional[int] = None,
-        opponent: str = "random",       # "random", "heuristic", or "human"
+        opponent: str = "random",              # "random", "heuristic", "policy", "human"
         step_penalty: float = -0.01,
         illegal_penalty: float = -0.05,
         opponent_starts_prob: float = 0.0,
         render_mode: Optional[str] = None,
-        human_move_fn: Optional[Callable[["Connect4"], int]] = None,  # used when opponent="human"
+        # Used when opponent="policy" or "human"
+        opponent_move_fn: Optional[OpponentFn] = None,
     ):
         super().__init__()
-        assert opponent in {"random", "heuristic", "human"}
+        assert opponent in {"random", "heuristic", "policy", "human"}
         assert 0.0 <= opponent_starts_prob <= 1.0
 
         self.opponent_type = opponent
@@ -50,8 +58,8 @@ class Connect4(gym.Env):
         self.opponent_starts_prob = float(opponent_starts_prob)
         self.render_mode = render_mode
 
-        # Optional callback for human move when opponent="human"
-        self.human_move_fn = human_move_fn
+        # Callback for "policy" or "human" opponents
+        self.opponent_move_fn = opponent_move_fn
 
         # Board: int8 in {-1, 0, +1}; +1 = agent, -1 = opponent
         self.state = np.zeros((self.ROWS, self.COLS), dtype=np.int8)
@@ -82,8 +90,11 @@ class Connect4(gym.Env):
 
         opp_started = False
         if self.np_random.random() < self.opponent_starts_prob:
-            self._opponent_move()
-            opp_started = True
+            # Opponent plays first
+            a = self._select_opponent_action()
+            if a is not None:
+                self._drop_piece(a, self.opp_id)
+                opp_started = True
 
         obs = self._obs()
         info = {"action_mask": self.action_mask(), "winner": None, "opp_started": opp_started}
@@ -109,7 +120,7 @@ class Connect4(gym.Env):
             return obs, 0.0, True, False, info
 
         # Opponent move
-        opp_action = self._opponent_policy()
+        opp_action = self._select_opponent_action()
         opp_row = self._drop_piece(opp_action, self.opp_id)
 
         if self._is_win(opp_row, opp_action, self.opp_id):
@@ -173,47 +184,37 @@ class Connect4(gym.Env):
                 return True
         return False
 
-    def _opponent_move(self) -> int:
-        """Execute opponent's move on the board and return the action used."""
-        a = self._opponent_policy()
-        self._drop_piece(a, self.opp_id)
-        return a
-
-    def _opponent_policy(self) -> int:
+    def _select_opponent_action(self) -> Optional[int]:
         legal = self._legal_actions()
         if legal.size == 0:
-            # Shouldn't be called if draw is checked, but just in case
-            return 0
+            return None
+
+        mask = self.action_mask()
+        obs = self._obs()
 
         if self.opponent_type == "random":
             return int(self.np_random.choice(legal))
 
         if self.opponent_type == "heuristic":
+            # Win now?
             for a in legal:
-                if self._would_win(a, self.opp_id):
-                    return a
+                if self._would_win(a, self.opp_id): return a
+            # Block agent?
             for a in legal:
-                if self._would_win(a, self.agent_id):
-                    return a
-            center_pref = [3, 2, 4, 1, 5, 0, 6]
-            for a in center_pref:
-                if a in legal:
-                    return a
+                if self._would_win(a, self.agent_id): return a
+            for a in [3, 2, 4, 1, 5, 0, 6]:
+                if a in legal: return a
             return int(self.np_random.choice(legal))
 
-        # Human-controlled opponent: delegate to callback
-        if self.opponent_type == "human":
-            if self.human_move_fn is None:
-                raise RuntimeError(
-                    "opponent='human' but no human_move_fn provided to Connect4(...)"
-                )
-            # The callback must return a legal action; we validate below
-            while True:
-                a = int(self.human_move_fn(self))
-                if self._is_legal(a):
-                    return a
-                # If illegal, ask again
-                print("Invalid move. Column full or out of range. Try again.")
+        if self.opponent_type in {"policy", "human"}:
+            if self.opponent_move_fn is None:
+                raise RuntimeError(f"Opponent type '{self.opponent_type}' requires opponent_move_fn.")
+            # The callback must return an int action; we validate & repair if needed.
+            a = int(self.opponent_move_fn(self, obs, mask))
+            if self._is_legal(a):
+                return a
+            # If the policy proposes illegal (e.g., not masked), fall back to any legal move
+            return int(self.np_random.choice(legal))
 
         raise RuntimeError("Unknown opponent type")
 
