@@ -101,6 +101,10 @@ class Connect4(gym.Env):
         return obs, info
 
     def step(self, action: int) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
+
+        # 0) Assert the game is actually playable
+        assert not self._is_draw(), "Env stepped on a full board without terminating."
+
         # Agent move
         if not self._is_legal(action):
             obs = self._obs()

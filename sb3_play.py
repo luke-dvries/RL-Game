@@ -10,7 +10,7 @@ SEED = 123
 
 
 def mask_fn(env):
-    return env.action_mask()
+    return (env.action_mask()).astype(bool)
 
 
 def ask_human_move(env: Connect4) -> int:

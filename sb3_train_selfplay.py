@@ -17,10 +17,10 @@ from sb3_connect4_env_selfplay import Connect4
 
 NUM_ENVS = 8
 SEED = 42
-TOTAL_TIMESTEPS = 500_000
+TOTAL_TIMESTEPS = 1_000_000
 
 # How often to freeze the current agent as an opponent (in env steps, not gradient steps)
-UPDATE_INTERVAL = 50_000
+UPDATE_INTERVAL = 25_000
 
 # Keep a small pool of past opponents to diversify training
 OPPONENT_POOL_SIZE = 5
